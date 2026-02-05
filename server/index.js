@@ -1,157 +1,166 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
+const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-const db = new sqlite3.Database('./banco_dados.db', (err) => {
-  if (err) console.error("Erro banco:", err.message);
-  else console.log("📦 Banco V8.0 (Completo) conectado!");
-});
+// --- CONFIGURAÇÃO DO MOTOR DE BANCO DE DADOS ---
+const isCloud = process.env.DATABASE_URL ? true : false;
+let db;
 
-db.serialize(() => {
-  // --- SEGURANÇA E ACESSO ---
-  db.run(`CREATE TABLE IF NOT EXISTS usuarios (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, senha TEXT, nome TEXT, cargo TEXT)`);
-  db.run(`INSERT OR IGNORE INTO usuarios (email, senha, nome, cargo) VALUES ('admin@prisma.com', '123', 'Admin', 'Gerente Geral')`);
-
-  // --- INDUSTRIAL E ENGENHARIA (FICHA TÉCNICA) ---
-  db.run(`CREATE TABLE IF NOT EXISTS ficha_tecnica (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    produto_pai_id INTEGER,
-    componente_id INTEGER,
-    quantidade REAL
-  )`);
-
-  // --- LOGÍSTICA DE SAÍDA (EXPEDIÇÃO) ---
-  db.run(`CREATE TABLE IF NOT EXISTS expedicao (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    venda_id INTEGER,
-    cliente TEXT,
-    status TEXT, -- 'Pendente', 'Em Separação', 'Enviado', 'Entregue'
-    data_saida TEXT
-  )`);
-
-  // --- TABELAS ANTERIORES (MANTIDAS) ---
-  db.run(`CREATE TABLE IF NOT EXISTS funcionarios (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT, cargo TEXT, cpf TEXT, foto_url TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS clientes (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT, cpf_cnpj TEXT, telefone TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS produtos (id INTEGER PRIMARY KEY AUTOINCREMENT, codigo TEXT, nome TEXT, preco_venda REAL, estoque INTEGER, ncm TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS vendas (id INTEGER PRIMARY KEY AUTOINCREMENT, cliente TEXT, total REAL, data TEXT, itens TEXT, condicao_pagamento TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS financeiro (id INTEGER PRIMARY KEY AUTOINCREMENT, descricao TEXT, tipo TEXT, valor REAL, categoria TEXT, data_vencimento TEXT, status TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS frota (id INTEGER PRIMARY KEY AUTOINCREMENT, placa TEXT, modelo TEXT, km_atual INTEGER, status TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS epis_entregas (id INTEGER PRIMARY KEY AUTOINCREMENT, funcionario_nome TEXT, epi_nome TEXT, data_validade TEXT)`);
-});
-
-// --- ROTAS DE USUÁRIOS E LOGIN ---
-app.post('/login', (req, res) => {
-  const { email, senha } = req.body;
-  db.get("SELECT * FROM usuarios WHERE email = ? AND senha = ?", [email, senha], (err, row) => {
-    if (row) res.json({ usuario: row });
-    else res.status(401).json({ erro: "Acesso Negado" });
-  });
-});
-
-app.get('/api/usuarios', (req, res) => { db.all("SELECT * FROM usuarios", [], (err, rows) => res.json(rows)); });
-app.post('/api/usuarios', (req, res) => {
-  const { nome, email, senha, cargo } = req.body;
-  db.run("INSERT INTO usuarios (nome, email, senha, cargo) VALUES (?,?,?,?)", [nome, email, senha, cargo], function() { res.json({id: this.lastID}); });
-});
-
-// --- ROTAS DE EXPEDIÇÃO ---
-app.get('/api/expedicao', (req, res) => { db.all("SELECT * FROM expedicao ORDER BY id DESC", [], (err, rows) => res.json(rows)); });
-app.put('/api/expedicao/:id', (req, res) => {
-  const { status } = req.body;
-  const dataHoje = new Date().toLocaleDateString('pt-BR');
-  db.run("UPDATE expedicao SET status = ?, data_saida = ? WHERE id = ?", [status, dataHoje, req.params.id], () => res.json({msg: "Ok"}));
-});
-
-// --- ROTA DE VENDA (INTEGRADA COM EXPEDIÇÃO) ---
-app.post('/vendas', (req, res) => {
-  const { cliente, total, itens, condicao_pagamento } = req.body;
-  const dataHoje = new Date().toLocaleDateString('pt-BR');
-  db.run(`INSERT INTO vendas (cliente, total, data, itens, condicao_pagamento) VALUES (?, ?, ?, ?, ?)`, 
-    [cliente, total, dataHoje, JSON.stringify(itens), condicao_pagamento], function(err) {
-      const idVenda = this.lastID;
-      // Cria automaticamente a ordem de expedição
-      db.run("INSERT INTO expedicao (venda_id, cliente, status) VALUES (?,?,?)", [idVenda, cliente, 'Pendente']);
-      res.json({ id: idVenda });
-  });
-});
-
-// --- ROTAS DE FICHA TÉCNICA ---
-app.get('/api/ficha/:id', (req, res) => {
-  db.all("SELECT f.*, p.nome FROM ficha_tecnica f JOIN produtos p ON f.componente_id = p.id WHERE f.produto_pai_id = ?", [req.params.id], (err, rows) => res.json(rows));
-});
-app.post('/api/ficha', (req, res) => {
-  const { produto_pai_id, componente_id, quantidade } = req.body;
-  db.run("INSERT INTO ficha_tecnica (produto_pai_id, componente_id, quantidade) VALUES (?,?,?)", [produto_pai_id, componente_id, quantidade], () => res.json({msg:"Ok"}));
-});
-
-// Mantém rotas antigas simplificadas para funcionamento
-app.get('/produtos', (req, res) => { db.all("SELECT * FROM produtos", [], (err, r) => res.json(r)); });
-app.get('/clientes', (req, res) => { db.all("SELECT * FROM clientes", [], (err, r) => res.json(r)); });
-app.get('/funcionarios', (req, res) => { db.all("SELECT * FROM funcionarios", [], (err, r) => res.json(r)); });
-
-// ROTA PARA PROCESSAR ENTRADA DE XML
-app.post('/api/estoque/entrada-xml', (req, res) => {
-  const { itens, fornecedor } = req.body;
-  const dataHoje = new Date().toLocaleDateString('pt-BR');
-
-  // Para cada item do XML
-  itens.forEach(item => {
-    // Tenta encontrar o produto pelo nome
-    db.get("SELECT id FROM produtos WHERE nome = ?", [item.nome], (err, row) => {
-      if (row) {
-        // Se existe, apenas aumenta o estoque
-        db.run("UPDATE produtos SET estoque = estoque + ?, preco_custo = ? WHERE id = ?", [item.qtd, item.vUn, row.id]);
-      } else {
-        // Se não existe, cadastra o produto novo automaticamente
-        db.run(`INSERT INTO produtos (codigo, nome, preco_custo, preco_venda, estoque, ncm, fornecedor) 
-                VALUES (?, ?, ?, ?, ?, ?, ?)`, 
-                [item.codigo, item.nome, item.vUn, item.vUn * 1.5, item.qtd, item.ncm, fornecedor]);
-      }
+if (isCloud) {
+    db = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false }
     });
-  });
+    console.log("🐘 Motor PostgreSQL (Nuvem) Ativo!");
+} else {
+    db = new sqlite3.Database('./banco_dados.db');
+    console.log("📦 Motor SQLite (Local) Ativo!");
+}
 
-  // Registra a entrada no financeiro como uma despesa futura (opcional)
-  const totalNota = itens.reduce((acc, i) => acc + i.total, 0);
-  db.run(`INSERT INTO financeiro (descricao, tipo, valor, categoria, data_vencimento, status) 
-          VALUES (?, 'despesa', ?, 'Compras', ?, 'pendente')`, 
-          [`Compra XML - ${fornecedor}`, totalNota, dataHoje]);
+// Função auxiliar para lidar com as diferenças de sintaxe entre SQLs
+const executar = (sql, params = []) => {
+    if (isCloud) {
+        // Converte o padrão '?' do SQLite para o '$1, $2' do PostgreSQL
+        const pgSql = sql.replace(/\?/g, (_, i) => `$${params.indexOf(params[i]) + 1}`);
+        return db.query(pgSql, params);
+    } else {
+        return new Promise((resolve, reject) => {
+            db.run(sql, params, function(err) {
+                if (err) reject(err);
+                else resolve({ lastID: this.lastID });
+            });
+        });
+    }
+};
 
-  res.json({ msg: "Processado com sucesso" });
+const consultar = (sql, params = []) => {
+    if (isCloud) {
+        return db.query(sql, params).then(res => res.rows);
+    } else {
+        return new Promise((resolve, reject) => {
+            db.all(sql, params, (err, rows) => {
+                if (err) reject(err);
+                else resolve(rows);
+            });
+        });
+    }
+};
+
+// --- INICIALIZAÇÃO DAS TABELAS (CONFORME CADA BANCO) ---
+const initDB = async () => {
+    const autoInc = isCloud ? "SERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT";
+    
+    const tabelas = [
+        `CREATE TABLE IF NOT EXISTS usuarios (id ${autoInc}, email TEXT UNIQUE, senha TEXT, nome TEXT, cargo TEXT)`,
+        `CREATE TABLE IF NOT EXISTS funcionarios (id ${autoInc}, nome TEXT, cargo TEXT, comissao_pct REAL, cpf TEXT)`,
+        `CREATE TABLE IF NOT EXISTS clientes (id ${autoInc}, nome TEXT, cpf_cnpj TEXT, telefone TEXT)`,
+        `CREATE TABLE IF NOT EXISTS produtos (id ${autoInc}, codigo TEXT, nome TEXT, preco_custo REAL, preco_venda REAL, estoque INTEGER, ncm TEXT, fornecedor TEXT)`,
+        `CREATE TABLE IF NOT EXISTS vendas (id ${autoInc}, cliente TEXT, total REAL, data TEXT, itens TEXT, condicao_pagamento TEXT, vendedor_id INTEGER)`,
+        `CREATE TABLE IF NOT EXISTS financeiro (id ${autoInc}, descricao TEXT, tipo TEXT, valor REAL, categoria TEXT, data_vencimento TEXT, status TEXT)`,
+        `CREATE TABLE IF NOT EXISTS frota (id ${autoInc}, placa TEXT, modelo TEXT, km_atual INTEGER, status TEXT)`,
+        `CREATE TABLE IF NOT EXISTS frota_logs (id ${autoInc}, veiculo_id INTEGER, tipo TEXT, valor REAL, km_registro INTEGER, data TEXT)`,
+        `CREATE TABLE IF NOT EXISTS epis_catalogo (id ${autoInc}, nome TEXT, ca TEXT, validade_dias INTEGER, estoque INTEGER)`,
+        `CREATE TABLE IF NOT EXISTS epis_entregas (id ${autoInc}, funcionario_nome TEXT, epi_nome TEXT, data_entrega TEXT, data_validade TEXT, status TEXT)`,
+        `CREATE TABLE IF NOT EXISTS ficha_tecnica (id ${autoInc}, produto_pai_id INTEGER, componente_id INTEGER, quantidade REAL)`,
+        `CREATE TABLE IF NOT EXISTS expedicao (id ${autoInc}, venda_id INTEGER, cliente TEXT, status TEXT, data_saida TEXT)`
+    ];
+
+    for (let sql of tabelas) {
+        if (isCloud) await db.query(sql); else db.run(sql);
+    }
+
+    // Criar usuário admin padrão
+    const adminSql = isCloud ? 
+        "INSERT INTO usuarios (email, senha, nome, cargo) VALUES ('admin@prisma.com', '123', 'Admin', 'Gerente') ON CONFLICT (email) DO NOTHING" :
+        "INSERT OR IGNORE INTO usuarios (email, senha, nome, cargo) VALUES ('admin@prisma.com', '123', 'Admin', 'Gerente')";
+    if (isCloud) await db.query(adminSql); else db.run(adminSql);
+};
+initDB();
+
+// --- ROTAS DO SISTEMA ---
+
+app.post('/login', async (req, res) => {
+    const { email, senha } = req.body;
+    const sql = "SELECT * FROM usuarios WHERE email = ? AND senha = ?";
+    const rows = await consultar(sql, [email, senha]);
+    if (rows.length > 0) res.json({ usuario: rows[0] });
+    else res.status(401).json({ erro: "Credenciais inválidas" });
 });
-// ROTA DE COMISSÕES (BI DE RH)
-app.get('/api/comissoes', (req, res) => {
-  // Busca todos os funcionários para ter as porcentagens
-  db.all("SELECT id, nome, cargo, comissao_pct FROM funcionarios", [], (err, funcs) => {
-    if (err) return res.status(500).json(err);
 
-    // Busca todas as vendas
-    db.all("SELECT total, cliente, data, vendedor_id FROM vendas", [], (err, vendas) => {
-      if (err) return res.status(500).json(err);
-
-      // Mapeia o resultado agrupando por funcionário
-      const relatorio = funcs.map(f => {
-        // Filtra vendas deste funcionário (usando nome ou ID)
-        const vendasDeste = vendas.filter(v => v.vendedor_id == f.id || v.cliente.includes(f.nome)); 
-        const totalVendido = vendasDeste.reduce((acc, v) => acc + v.total, 0);
-        const valorComissao = totalVendido * (f.comissao_pct / 100);
-
-        return {
-          id: f.id,
-          nome: f.nome,
-          cargo: f.cargo,
-          pct: f.comissao_pct,
-          totalVendido: totalVendido,
-          valorComissao: valorComissao,
-          qtdVendas: vendasDeste.length
-        };
-      });
-
-      res.json(relatorio);
+app.get('/api/estatisticas', async (req, res) => {
+    const vendas = await consultar("SELECT * FROM vendas");
+    const faturamento = vendas.reduce((acc, v) => acc + v.total, 0);
+    res.json({ 
+        resumo: { faturamento, totalVendas: vendas.length, ticketMedio: faturamento/vendas.length || 0 },
+        vendasMensais: [], topProdutos: [] 
     });
-  });
 });
-app.listen(3000, () => { console.log('🚀 Servidor V8.0 (Completo) rodando!'); });
+
+app.get('/vendas', async (req, res) => res.json(await consultar("SELECT * FROM vendas ORDER BY id DESC")));
+
+app.post('/vendas', async (req, res) => {
+    const { cliente, total, itens, condicao_pagamento, vendedor_id } = req.body;
+    const data = new Date().toLocaleDateString('pt-BR');
+    const result = await executar(
+        "INSERT INTO vendas (cliente, total, data, itens, condicao_pagamento, vendedor_id) VALUES (?,?,?,?,?,?)",
+        [cliente, total, JSON.stringify(itens), condicao_pagamento, vendedor_id]
+    );
+    const idVenda = isCloud ? (await consultar("SELECT last_value FROM vendas_id_seq"))[0].last_value : result.lastID;
+    await executar("INSERT INTO expedicao (venda_id, cliente, status) VALUES (?,?,?)", [idVenda, cliente, 'Pendente']);
+    res.json({ id: idVenda });
+});
+
+app.get('/produtos', async (req, res) => res.json(await consultar("SELECT * FROM produtos ORDER BY nome")));
+
+app.post('/api/estoque/entrada-xml', async (req, res) => {
+    const { itens, fornecedor } = req.body;
+    for (let item of itens) {
+        const existe = await consultar("SELECT id FROM produtos WHERE nome = ?", [item.nome]);
+        if (existe.length > 0) {
+            await executar("UPDATE produtos SET estoque = estoque + ?, preco_custo = ? WHERE id = ?", [item.qtd, item.vUn, existe[0].id]);
+        } else {
+            await executar("INSERT INTO produtos (codigo, nome, preco_custo, preco_venda, estoque, ncm, fornecedor) VALUES (?,?,?,?,?,?,?)",
+            [item.codigo, item.nome, item.vUn, item.vUn * 1.5, item.qtd, item.ncm, fornecedor]);
+        }
+    }
+    res.json({ status: "ok" });
+});
+
+app.get('/api/comissoes', async (req, res) => {
+    const funcs = await consultar("SELECT * FROM funcionarios");
+    const vendas = await consultar("SELECT * FROM vendas");
+    const result = funcs.map(f => {
+        const vDeste = vendas.filter(v => v.vendedor_id == f.id);
+        const total = vDeste.reduce((a, b) => a + b.total, 0);
+        return { id: f.id, nome: f.nome, cargo: f.cargo, pct: f.comissao_pct, totalVendido: total, valorComissao: total * (f.comissao_pct/100), qtdVendas: vDeste.length };
+    });
+    res.json(result);
+});
+
+// Rota XML (Mantida original com ajuste de conexão)
+app.get('/fiscal/xml/:id', async (req, res) => {
+    const rows = await consultar("SELECT * FROM vendas WHERE id = ?", [req.params.id]);
+    if (rows.length === 0) return res.status(404).send("Venda não encontrada");
+    const venda = rows[0];
+    const itens = JSON.parse(venda.itens);
+    let xml = `<?xml version="1.0" encoding="UTF-8"?><nfeProc versao="4.00" xmlns="http://www.portalfiscal.inf.br/nfe"><NFe><infNFe Id="NFe${venda.id}"><emit><xNome>PRISMA ERP PRO</xNome></emit><dest><xNome>${venda.cliente}</xNome></dest><det>`;
+    itens.forEach((item, i) => { xml += `<prod><nItem>${i+1}</nItem><xProd>${item.nome}</xProd><qCom>${item.qtd}</qCom><vProd>${item.total}</vProd></prod>`; });
+    xml += `</det><total><vNF>${venda.total}</vNF></total></infNFe></NFe></nfeProc>`;
+    res.set('Content-Type', 'text/xml');
+    res.send(xml);
+});
+
+// Rotas de RH, Frota, EPIs, Expedição (Simplificadas para o motor novo)
+app.get('/funcionarios', async (req, res) => res.json(await consultar("SELECT * FROM funcionarios")));
+app.get('/api/expedicao', async (req, res) => res.json(await consultar("SELECT * FROM expedicao")));
+app.get('/api/usuarios', async (req, res) => res.json(await consultar("SELECT * FROM usuarios")));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`🚀 Servidor PRISMA PRO Online na porta ${PORT}`);
+});
