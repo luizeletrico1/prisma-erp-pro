@@ -1,0 +1,5 @@
+node_modules
+.env
+server/banco_dados.db
+server/node_modules
+dist
